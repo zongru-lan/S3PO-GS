@@ -5,6 +5,7 @@ import time
 import numpy as np
 from argparse import ArgumentParser
 from datetime import datetime
+from pathlib import Path
 import pandas as pd
 
 import torch
@@ -21,10 +22,58 @@ from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
+from utils.railway_export import export_railway_results
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
 
 from mast3r.model import AsymmetricMASt3R
+
+
+DEFAULT_MAST3R_CHECKPOINT = (
+    Path(__file__).resolve().parent
+    / "checkpoints"
+    / "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+)
+REMOTE_MAST3R_MODEL = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
+
+
+def resolve_mast3r_model_path(config, cli_model_path=None):
+    candidates = []
+    if cli_model_path:
+        candidates.append(Path(cli_model_path).expanduser())
+    model_cfg = config.get("Model", {})
+    if model_cfg.get("checkpoint"):
+        candidates.append(Path(model_cfg["checkpoint"]).expanduser())
+    model_path = config.get("model_params", {}).get("model_path")
+    if model_path:
+        candidates.append(Path(model_path).expanduser())
+    candidates.append(DEFAULT_MAST3R_CHECKPOINT)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return REMOTE_MAST3R_MODEL
+
+
+def get_railway_sequence_output_dir(config):
+    dataset_cfg = config["Dataset"]
+    scene = dataset_cfg.get("scene")
+    if not scene:
+        scene = os.path.basename(dataset_cfg["dataset_path"].rstrip("/"))
+    return os.path.join(config["Results"]["save_dir"], scene)
+
+
+def get_sequence_save_dir(config, current_datetime):
+    dataset_cfg = config["Dataset"]
+    if dataset_cfg.get("type") == "railway":
+        return os.path.join(
+            get_railway_sequence_output_dir(config), "internal_runs", current_datetime
+        )
+
+    path = dataset_cfg["dataset_path"].split("/")
+    return os.path.join(
+        config["Results"]["save_dir"], path[-3] + "_" + path[-2], current_datetime
+    )
 
 
 class SLAM:
@@ -205,6 +254,24 @@ class SLAM:
             gui_process.join()
             Log("GUI Stopped and joined the main thread")
 
+        if (
+            self.config["Dataset"].get("type") == "railway"
+            and self.config["Results"].get("save_results", True)
+            and self.config["Results"].get("clean_export", True)
+        ):
+            if not self.eval_rendering:
+                self.gaussians = self.frontend.gaussians
+            export_railway_results(
+                self.frontend.cameras,
+                self.frontend.kf_indices,
+                self.gaussians,
+                self.dataset,
+                self.save_dir,
+                self.pipeline_params,
+                self.background,
+                self.config,
+            )
+
     def run(self):
         pass
 
@@ -225,6 +292,9 @@ if __name__ == "__main__":
     parser.add_argument("--iter", type=int, default=None, help="iteration count of pose optimization")
     parser.add_argument("--windowsize", type=int, default=None, help="window size of local BA")
     parser.add_argument("--patch_size", type=int, default=None, help="patch size")
+    parser.add_argument("--ns", type=int, default=None, help="mapping iterations for non-single-thread mode")
+    parser.add_argument("--sh", type=int, default=None, help="spherical harmonics degree")
+    parser.add_argument("--model_path", type=str, default=None, help="local MASt3R checkpoint path")
     
 
     args = parser.parse_args(sys.argv[1:])
@@ -269,11 +339,10 @@ if __name__ == "__main__":
 
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])
+        if config["Dataset"].get("type") == "railway":
+            config["Results"]["sequence_save_dir"] = get_railway_sequence_output_dir(config)
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")   
-        path = config["Dataset"]["dataset_path"].split("/")
-        save_dir = os.path.join(
-            config["Results"]["save_dir"], path[-3] + "_" + path[-2], current_datetime
-        )
+        save_dir = get_sequence_save_dir(config, current_datetime)
         tmp = args.config
         tmp = tmp.split(".")[0]
         config["Results"]["save_dir"] = save_dir
@@ -290,7 +359,8 @@ if __name__ == "__main__":
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
         
-    model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
+    model_name = resolve_mast3r_model_path(config, args.model_path)
+    Log("Loading MASt3R model from " + model_name)
     mast3r_model = AsymmetricMASt3R.from_pretrained(model_name).to("cuda")
     
     slam = SLAM(config, save_dir=save_dir,mast3r_model=mast3r_model)

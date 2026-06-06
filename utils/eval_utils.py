@@ -26,11 +26,67 @@ from gaussian_splatting.utils.loss_utils import ssim
 from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
 
+def align_trajectory_robust(traj_est, traj_ref, correct_scale=False):
+    try:
+        return trajectory.align_trajectory(
+            traj_est, traj_ref, correct_scale=correct_scale
+        )
+    except Exception as exc:
+        Log(
+            f"evo alignment failed ({exc}); using point-based fallback alignment",
+            tag="Eval",
+        )
+        return PosePath3D(
+            poses_se3=_align_poses_by_translation(
+                traj_est.poses_se3, traj_ref.poses_se3, correct_scale
+            )
+        )
+
+
+def _align_poses_by_translation(est_poses, gt_poses, correct_scale):
+    est_xyz = np.asarray([pose[:3, 3] for pose in est_poses], dtype=np.float64)
+    gt_xyz = np.asarray([pose[:3, 3] for pose in gt_poses], dtype=np.float64)
+    rot, trans, scale = _umeyama_points(est_xyz, gt_xyz, correct_scale)
+    aligned = []
+    for pose in est_poses:
+        aligned_pose = np.array(pose, dtype=np.float64, copy=True)
+        aligned_pose[:3, :3] = rot @ aligned_pose[:3, :3]
+        aligned_pose[:3, 3] = scale * (rot @ aligned_pose[:3, 3]) + trans
+        aligned.append(aligned_pose)
+    return aligned
+
+
+def _umeyama_points(source_xyz, target_xyz, with_scale):
+    if len(source_xyz) != len(target_xyz):
+        raise ValueError("source and target trajectories must have the same length")
+    if len(source_xyz) == 0:
+        raise ValueError("cannot align an empty trajectory")
+
+    source_mean = source_xyz.mean(axis=0)
+    target_mean = target_xyz.mean(axis=0)
+    source_centered = source_xyz - source_mean
+    target_centered = target_xyz - target_mean
+    covariance = target_centered.T @ source_centered / len(source_xyz)
+    u_mat, singular_values, vt_mat = np.linalg.svd(covariance)
+    sign = np.ones(3)
+    if np.linalg.det(u_mat) * np.linalg.det(vt_mat) < 0:
+        sign[-1] = -1.0
+    rot = u_mat @ np.diag(sign) @ vt_mat
+
+    scale = 1.0
+    if with_scale:
+        variance = np.mean(np.sum(source_centered**2, axis=1))
+        if variance > 1e-12:
+            scale = float(np.sum(singular_values * sign) / variance)
+    trans = target_mean - scale * (rot @ source_mean)
+    return rot, trans, scale
+
+
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ## Plot
     traj_ref = PosePath3D(poses_se3=poses_gt)
     traj_est = PosePath3D(poses_se3=poses_est)
-    traj_est_aligned = trajectory.align_trajectory(
+    traj_est_aligned = align_trajectory_robust(
         traj_est, traj_ref, correct_scale=monocular
     )
     ## RMSE
